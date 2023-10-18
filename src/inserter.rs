@@ -13,32 +13,38 @@ const DEFAULT_MAX_ENTRIES: u64 = 500_000;
 
 /// Performs multiple consecutive `INSERT`s.
 ///
+/// TODO
+///
 /// Rows are being sent progressively to spread network load.
 #[must_use]
 pub struct Inserter<T> {
     client: Client,
     table: String,
+    max_bytes: u64,
     max_entries: u64,
     send_timeout: Option<Duration>,
     end_timeout: Option<Duration>,
     insert: Option<Insert<T>>,
     ticks: Ticks,
     committed: Quantities,
-    uncommitted_entries: u64,
+    in_transaction: bool,
 }
 
 /// Statistics about inserted rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Quantities {
-    /// How many rows ([`Inserter::write`]) have been inserted.
+    /// The number of bytes.
+    pub bytes: u64,
+    /// The number for rows (calls of [`Inserter::write`]).
     pub entries: u64,
-    /// How many nonempty transactions ([`Inserter::commit`]) have been inserted.
+    /// The number of nonempty transactions (calls of [`Inserter::commit`]).
     pub transactions: u64,
 }
 
 impl Quantities {
     /// Just zero quantities, nothing special.
     pub const ZERO: Quantities = Quantities {
+        bytes: 0,
         entries: 0,
         transactions: 0,
     };
@@ -52,17 +58,18 @@ where
         Ok(Self {
             client: client.clone(),
             table: table.into(),
+            max_bytes: u64::MAX,
             max_entries: DEFAULT_MAX_ENTRIES,
             send_timeout: None,
             end_timeout: None,
             insert: None,
             ticks: Ticks::default(),
             committed: Quantities::ZERO,
-            uncommitted_entries: 0,
+            in_transaction: false,
         })
     }
 
-    /// See [`Insert::with_max_entries()`].
+    /// See [`Insert::with_timeouts()`].
     ///
     /// Note that [`Inserter::commit()`] can call [`Insert::end()`] inside,
     /// so `end_timeout` is also applied to `commit()` method.
@@ -72,6 +79,12 @@ where
         end_timeout: Option<Duration>,
     ) -> Self {
         self.set_timeouts(send_timeout, end_timeout);
+        self
+    }
+
+    /// TODO
+    pub fn with_max_bytes(mut self, bytes: u64) -> Self {
+        self.set_max_bytes(bytes);
         self
     }
 
@@ -100,9 +113,11 @@ where
     }
 
     /// Adds a bias to the period. The actual period will be in the following range:
-    /// ```ignore
+    /// ```text
     ///   [period * (1 - bias), period * (1 + bias)]
     /// ```
+    ///
+    /// The `bias` parameter is clamped to the range `[0, 1]`.
     ///
     /// It helps to avoid producing a lot of `INSERT`s at the same time by multiple inserters.
     pub fn with_period_bias(mut self, bias: f64) -> Self {
@@ -123,6 +138,11 @@ where
         if let Some(insert) = &mut self.insert {
             insert.set_timeouts(self.send_timeout, self.end_timeout);
         }
+    }
+
+    /// See [`Inserter::with_max_bytes()`].
+    pub fn set_max_bytes(&mut self, bytes: u64) {
+        self.max_bytes = bytes;
     }
 
     /// See [`Inserter::with_max_entries()`].
@@ -158,7 +178,14 @@ where
         )
     }
 
+    /// TODO
+    pub fn pending(&self) -> &Quantities {
+        &self.committed
+    }
+
     /// Serializes and writes to the socket a provided row.
+    ///
+    /// TODO
     ///
     /// # Panics
     /// If called after previous call returned an error.
@@ -167,22 +194,31 @@ where
     where
         T: Serialize,
     {
-        self.uncommitted_entries += 1;
+        self.committed.entries += 1;
+
+        if !self.in_transaction {
+            self.committed.transactions += 1;
+            self.in_transaction = true;
+        }
+
         if self.insert.is_none() {
             if let Err(e) = self.init_insert() {
                 return Either::Right(future::ready(Result::<()>::Err(e)));
             }
         }
-        Either::Left(self.insert.as_mut().unwrap().write(row))
+
+        let writing = self.insert.as_mut().unwrap().write(row);
+        let committed = &mut self.committed;
+        Either::Left(async move {
+            let bytes = writing.await?;
+            committed.bytes += bytes as u64; // TODO
+            Ok(())
+        })
     }
 
-    /// Checks limits and ends a current `INSERT` if they are reached.
+    /// Checks limits and ends the current `INSERT` if they are reached.
     pub async fn commit(&mut self) -> Result<Quantities> {
-        if self.uncommitted_entries > 0 {
-            self.committed.entries += self.uncommitted_entries;
-            self.committed.transactions += 1;
-            self.uncommitted_entries = 0;
-        }
+        self.in_transaction = false;
 
         let now = Instant::now();
 
@@ -209,6 +245,7 @@ where
 
     fn is_threshold_reached(&self, now: Instant) -> bool {
         self.committed.entries >= self.max_entries
+            || self.committed.bytes >= self.max_bytes
             || self.ticks.next_at().map_or(false, |next_at| now >= next_at)
     }
 
