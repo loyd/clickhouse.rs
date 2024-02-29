@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use clickhouse::{error::Error, Row};
+use clickhouse::{error::Error, AsyncInsertOptions, Row};
 
 #[tokio::test]
 async fn smoke() {
@@ -29,6 +29,78 @@ async fn smoke() {
     let mut insert = client.insert("test").unwrap();
     for i in 0..1000 {
         insert.write(&MyRow { no: i, name: "foo" }).await.unwrap();
+    }
+
+    insert.end().await.unwrap();
+
+    // Read from the table.
+    let mut cursor = client
+        .query("SELECT ?fields FROM test WHERE name = ? AND no BETWEEN ? AND ?.2")
+        .bind("foo")
+        .bind(500)
+        .bind((42, 504))
+        .fetch::<MyRow<'_>>()
+        .unwrap();
+
+    let mut i = 500;
+
+    while let Some(row) = cursor.next().await.unwrap() {
+        assert_eq!(row.no, i);
+        assert_eq!(row.name, "foo");
+        i += 1;
+    }
+}
+
+#[tokio::test]
+async fn async_insert() {
+    let client = prepare_database!();
+
+    #[derive(Debug, Row, Serialize, Deserialize)]
+    struct MyRow<'a> {
+        no: u32,
+        name: &'a str,
+        ts: u32,
+    }
+
+    // Create a table.
+    client
+        .query(
+            "
+        CREATE TABLE test(
+            no UInt32,
+            name LowCardinality(String),
+            ts Datetime
+        )
+        ENGINE = MergeTree
+        ORDER BY no
+    ",
+        )
+        .execute()
+        .await
+        .unwrap();
+
+    //  Async-write to the table.
+    let opts = AsyncInsertOptions::builder()
+        .async_insert(true)
+        .async_insert_threads(8)
+        .wait_for_async_insert(true)
+        .wait_for_async_insert_timeout(42)
+        .async_insert_max_data_size(42)
+        .async_insert_max_query_number(42)
+        .async_insert_busy_timeout_ms(42)
+        .async_insert_stale_timeout_ms(42)
+        .async_insert_deduplicate(true)
+        .build();
+    let mut insert = client.async_insert("test", opts).unwrap();
+    for i in 0..1000 {
+        insert
+            .write(&MyRow {
+                no: i,
+                name: "foo",
+                ts: 42,
+            })
+            .await
+            .unwrap();
     }
 
     insert.end().await.unwrap();
