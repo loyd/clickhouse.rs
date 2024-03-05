@@ -17,6 +17,7 @@ pub use clickhouse_derive::Row;
 pub use self::{compression::Compression, row::Row};
 use self::{error::Result, http_client::HttpClient};
 
+pub mod delete;
 pub mod error;
 pub mod insert;
 #[cfg(feature = "inserter")]
@@ -26,6 +27,7 @@ pub mod serde;
 pub mod sql;
 #[cfg(feature = "test-util")]
 pub mod test;
+pub mod update;
 #[cfg(feature = "watch")]
 pub mod watch;
 
@@ -178,6 +180,14 @@ impl Client {
         insert::Insert::new(self, table)
     }
 
+    pub fn insert_with_fields_name<T: Row>(
+        &self,
+        table: &str,
+        fields_names: Vec<String>,
+    ) -> Result<insert::Insert<T>> {
+        insert::Insert::new_with_field_names(self, table, fields_names)
+    }
+
     /// Creates an inserter to perform multiple INSERTs.
     #[cfg(feature = "inserter")]
     pub fn inserter<T: Row>(&self, table: &str) -> Result<inserter::Inserter<T>> {
@@ -187,6 +197,19 @@ impl Client {
     /// Starts a new SELECT/DDL query.
     pub fn query(&self, query: &str) -> query::Query {
         query::Query::new(self, query)
+    }
+
+    pub fn delete(&self, table_name: &str, pk_names: Vec<String>) -> delete::Delete {
+        delete::Delete::new(self, table_name, pk_names)
+    }
+
+    pub fn update(
+        &self,
+        table_name: &str,
+        pk_names: Vec<String>,
+        flieds_names: Vec<String>,
+    ) -> update::Update {
+        update::Update::new(self, table_name, pk_names, flieds_names)
     }
 
     /// Starts a new WATCH query.
